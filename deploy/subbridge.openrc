@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+name="SubBridge"
+description="Subscription converter and management panel"
+command="/usr/local/lib/subbridge/subbridge-core"
+command_args="-config /etc/subbridge/config.json -management-config /etc/subbridge/management.json"
+command_user="subbridge"
+directory="/var/lib/subbridge"
+supervisor="supervise-daemon"
+pidfile="/run/subbridge.pid"
+umask="0077"
+respawn_delay=10
+respawn_max=0
+output_log="/var/log/subbridge.log"
+error_log="/var/log/subbridge.log"
+export GOMAXPROCS=1
+export GOMEMLIMIT=256MiB
+depend() { need net; after firewall; }
+start_pre() {
+    checkpath --directory --mode 0700 --owner subbridge:subbridge /var/lib/subbridge
+    checkpath --file --mode 0600 --owner subbridge:subbridge /var/log/subbridge.log
+}

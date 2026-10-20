@@ -1,0 +1,147 @@
+name: Build and release
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: subbridge-${{ github.workflow }}-${{ github.ref_type == 'branch' && github.event_name != 'pull_request' && 'dev' || github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      release-tag: ${{ steps.version.outputs.release-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version="1.1.0-dev.${GITHUB_SHA:0:12}"
+          tag=dev
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=${GITHUB_REF#refs/tags/v}
+            tag=${GITHUB_REF#refs/tags/}
+          fi
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || exit 1
+          echo "SUBBRIDGE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "SUBBRIDGE_RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "release-tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Test with a verified hard 4 GiB cgroup
+        run: sudo env "PATH=$PATH" bash test.sh
+      - name: Check configuration selection for multiple recipients
+        run: sudo env "PATH=$PATH" bash scripts/with-limits.sh node --max-old-space-size=256 --test --test-concurrency=1 scripts/check-selection.mjs
+      - name: Build all targets sequentially
+        run: sudo env "PATH=$PATH" "SUBBRIDGE_VERSION=$SUBBRIDGE_VERSION" bash build.sh all
+      - name: Package with Go and test staged installer
+        run: |
+          sudo env "PATH=$PATH" "SUBBRIDGE_VERSION=$SUBBRIDGE_VERSION" "SUBBRIDGE_RELEASE_TAG=$SUBBRIDGE_RELEASE_TAG" bash package.sh
+          sudo env "PATH=$PATH" "SUBBRIDGE_VERSION=$SUBBRIDGE_VERSION" "SUBBRIDGE_RELEASE_TAG=$SUBBRIDGE_RELEASE_TAG" bash scripts/with-limits.sh bash -c 'bash scripts/check-install.sh && bash scripts/check-release.sh'
+      - name: Build Windows Job supervisor under the same cap
+        run: sudo env "PATH=$PATH" bash scripts/with-limits.sh env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -p=1 -trimpath -o dist/ci/joblimit.exe ./tools/joblimit
+      - name: Check static binary and installer with Alpine musl and BusyBox
+        run: |
+          docker run --rm --memory=4g --memory-swap=4g --cpus=1 --pids-limit=256 \
+            -e "SUBBRIDGE_VERSION=$SUBBRIDGE_VERSION" -e "SUBBRIDGE_RELEASE_TAG=$SUBBRIDGE_RELEASE_TAG" -v "$PWD:/src:ro" alpine:3.22 sh -ec \
+            'test "$(cat /sys/fs/cgroup/memory.max)" = 4294967296; apk add --no-cache bash curl coreutils; cd /src; bash scripts/check-install.sh'
+      - name: Check service installation and rollback in disposable containers
+        run: |
+          for init in systemd openrc; do
+            docker run --rm --memory=4g --memory-swap=4g --cpus=1 --pids-limit=256 \
+              -e SUBBRIDGE_INSTALLER_CONTAINER_TEST=1 \
+              -e "SUBBRIDGE_VERSION=$SUBBRIDGE_VERSION" -e "SUBBRIDGE_RELEASE_TAG=$SUBBRIDGE_RELEASE_TAG" \
+              -v "$PWD:/src:ro" alpine:3.22 sh -ec \
+              'test "$(cat /sys/fs/cgroup/memory.max)" = 4294967296; apk add --no-cache bash coreutils; cd /src; bash scripts/check-install-services.sh "$1"' _ "$init"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/releases/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-supervisor
+          path: dist/ci/joblimit.exe
+          if-no-files-found: error
+  windows:
+    needs: linux
+    strategy:
+      max-parallel: 1
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-supervisor
+          path: ci
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: release
+      - name: Test inside a verified 4 GiB Windows Job
+        shell: pwsh
+        run: |
+          & .\ci\joblimit.exe pwsh -NoProfile -File scripts/check-windows.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+  linux-compatibility:
+    needs: linux
+    strategy:
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: release
+      - name: Run static binary on this distribution
+        shell: bash
+        run: |
+          cd release
+          sha256sum -c checksums.txt
+          mkdir unpack
+          tar -xzf subbridge-*-linux-amd64.tar.gz -C unpack
+          chmod +x unpack/subbridge
+          unpack/subbridge -version
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [linux, windows, linux-compatibility]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: release
+      - name: Publish checked archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.linux.outputs.release-tag }}
+        run: bash scripts/publish-release.sh release "$RELEASE_TAG" "$GITHUB_SHA"

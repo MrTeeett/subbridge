@@ -1,0 +1,33 @@
+{
+  "source": {
+    "url": "https://provider.example/subscription",
+    "hwid": "",
+    "hwid_attempts": 3,
+    "user_agent": "v2raytun/android",
+    "device_os": "Android",
+    "os_version": "",
+    "device_model": "",
+    "app_version": "5.26.83"
+  },
+  "source_name": "Primary subscription",
+  "sources": [],
+  "listen": "127.0.0.1:8770",
+  "public_url": "http://127.0.0.1:8770",
+  "data_dir": "/var/lib/subbridge",
+  "refresh_seconds": 300,
+  "export_profile": "original",
+  "panel": {
+    "enabled": false,
+    "auth_mode": "environment",
+    "url": "https://panel.example:2053/SECRET_BASE_PATH",
+    "api_token_env": "SUBBRIDGE_PANEL_TOKEN",
+    "username_env": "SUBBRIDGE_PANEL_USERNAME",
+    "password_env": "SUBBRIDGE_PANEL_PASSWORD",
+    "all_clients": false,
+    "emails": [],
+    "inbound_ids": [],
+    "sync_seconds": 60,
+    "name_prefix": "",
+    "delivery_mode": "direct"
+  }
+}
